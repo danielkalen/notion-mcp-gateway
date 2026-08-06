@@ -38,6 +38,12 @@ setInterval(sweepExpired, 5 * 60 * 1000).unref();
 
 const app = express();
 app.disable("x-powered-by");
+// Sevalla terminates TLS at Cloudflare's edge and forwards requests with
+// X-Forwarded-For / X-Forwarded-Proto. Express must trust one proxy hop so
+// express-rate-limit can key off the real client IP and getBaseUrl() reads
+// the correct scheme — otherwise the limiter throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+// and every /authorize and /token call 500s.
+app.set("trust proxy", 1);
 app.use(express.json());
 
 const authLimiter = rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: true, legacyHeaders: false });
