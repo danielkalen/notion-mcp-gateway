@@ -1,0 +1,17 @@
+{
+  "name": "notion-mcp-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "easy-notion-mcp": "^1.0.1",
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "express": "^5.2.1",
+    "express-rate-limit": "^7.4.0",
+    "dotenv": "^17.2.3"
+  }
+}
