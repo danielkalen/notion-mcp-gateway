@@ -45,6 +45,11 @@ app.disable("x-powered-by");
 // and every /authorize and /token call 500s.
 app.set("trust proxy", 1);
 app.use(express.json());
+// OAuth 2.0 token endpoints MUST accept application/x-www-form-urlencoded per
+// RFC 6749 §3.2 — Claude.ai (python-httpx) sends the /token request form-encoded,
+// not JSON. Without this parser, req.body is undefined and every token exchange
+// returns 400 unsupported_grant_type, failing the whole OAuth dance.
+app.use(express.urlencoded({ extended: true }));
 
 const authLimiter = rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: true, legacyHeaders: false });
 
