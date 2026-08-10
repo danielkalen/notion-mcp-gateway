@@ -11,6 +11,10 @@ const ALLOWED_REDIRECT_URI =
   process.env.OAUTH_REDIRECT_URI ?? "https://claude.ai/api/mcp/auth_callback";
 const ROOT_PAGE_ID = process.env.NOTION_ROOT_PAGE_ID;
 const TRUST_CONTENT = process.env.NOTION_TRUST_CONTENT === "true";
+// Optional uniform connector check for org-shared connectors. When set, the
+// client_secret sent at /token must match this value — same for every member,
+// carries no per-person meaning. When unset, client_secret is ignored entirely.
+const SHARED_CLIENT_SECRET = process.env.SHARED_CLIENT_SECRET || null;
 
 function getBaseUrl(req) {
   if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL.replace(/\/$/, "");
@@ -20,7 +24,7 @@ function getBaseUrl(req) {
 }
 
 // In-memory only — cleared on restart/redeploy, by design (see "Operational notes").
-const codes = new Map();          // code          -> { clientId, redirectUri, codeChallenge, codeChallengeMethod, expires }
+const codes = new Map();          // code          -> { notionToken, clientId, redirectUri, codeChallenge, codeChallengeMethod, expires }
 const accessTokens = new Map();   // access token  -> { notionToken, expires }
 const refreshTokens = new Map();  // refresh token -> { notionToken, expires }
 
@@ -59,7 +63,8 @@ app.get("/", (_req, res) => {
 
 // --- OAuth discovery (no registration_endpoint on purpose — this forces
 // Claude.ai to use the manual Client ID / Client Secret fields instead of
-// auto-registering, which is what lets the "secret" be your Notion token) ---
+// auto-registering; the "secret" is now just an optional uniform connector
+// check, and each person's Notion token is collected at /authorize instead) ---
 app.get("/.well-known/oauth-protected-resource", (req, res) => {
   const baseUrl = getBaseUrl(req);
   res.json({
@@ -83,20 +88,98 @@ app.get("/.well-known/oauth-authorization-server", (req, res) => {
   });
 });
 
-// --- Authorize: no secret is visible here (correct OAuth semantics — the
-// secret only ever travels server-to-server at /token) ---
+// --- HTML helpers for the personal /authorize interaction ---
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function renderAuthorizeForm({ client_id, redirect_uri, code_challenge, code_challenge_method, state, error }) {
+  const errorHtml = error ? `<div class="error">${escapeHtml(error)}</div>` : "";
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect your Notion to Claude</title>
+<style>
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#f6f6f4;color:#191919;margin:0;padding:24px;min-height:100vh;display:flex;justify-content:center}
+  form.card{max-width:480px;width:100%;background:#fff;border-radius:14px;padding:32px;box-shadow:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.04);margin-top:48px}
+  h1{font-size:20px;margin:0 0 6px}
+  .sub{font-size:14px;line-height:1.5;color:#666;margin:0 0 20px}
+  label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}
+  input[name=notion_token]{width:100%;padding:11px 12px;font-size:14px;border:1px solid #d6d6d6;border-radius:8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  input[name=notion_token]:focus{outline:none;border-color:#191919;box-shadow:0 0 0 3px rgba(25,25,25,.08)}
+  button{margin-top:16px;width:100%;padding:12px;font-size:14px;font-weight:600;background:#191919;color:#fff;border:none;border-radius:8px;cursor:pointer}
+  button:hover{background:#000}
+  .error{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca;padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:16px}
+  .hint{font-size:12.5px;line-height:1.5;color:#888;margin:14px 0 0}
+  a{color:#191919}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+</style>
+</head>
+<body>
+<form class="card" method="POST" action="/authorize" autocomplete="off">
+  <h1>Connect your Notion</h1>
+  <p class="sub">Paste your own Notion integration token. It is validated against Notion now and bound to your personal session — not shared with anyone else using this connector.</p>
+  ${errorHtml}
+  <label for="notion_token">Notion integration token</label>
+  <input id="notion_token" name="notion_token" type="password" placeholder="ntn_..." autocomplete="off" autofocus required>
+  <button type="submit">Connect</button>
+  <p class="hint">Create a token at <a href="https://www.notion.so/profile/integrations" target="_blank" rel="noopener">notion.so/profile/integrations</a>, then share each page/database you want Claude to reach via its <code>···</code> → Connections menu.</p>
+  <input type="hidden" name="response_type" value="code">
+  <input type="hidden" name="client_id" value="${escapeHtml(client_id)}">
+  <input type="hidden" name="redirect_uri" value="${escapeHtml(redirect_uri)}">
+  <input type="hidden" name="code_challenge" value="${escapeHtml(code_challenge)}">
+  <input type="hidden" name="code_challenge_method" value="${escapeHtml(code_challenge_method)}">
+  <input type="hidden" name="state" value="${escapeHtml(state)}">
+</form>
+</body>
+</html>`;
+}
+
+function renderAuthorizeError(message) {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Authorization error</title><style>body{font-family:-apple-system,sans-serif;background:#f6f6f4;color:#191919;padding:48px;text-align:center}.card{max-width:420px;margin:0 auto;background:#fff;border-radius:14px;padding:32px;box-shadow:0 1px 3px rgba(0,0,0,.08)}h1{font-size:18px}p{color:#666;font-size:14px}</style></head><body><div class="card"><h1>Authorization error</h1><p>${escapeHtml(message)}</p></div></body></html>`;
+}
+
+// --- Authorize (personal, per-person): the only point in the flow where an
+// individual hands over their own Notion token, even under a shared org
+// connector. Claude.ai opens this URL in each member's own browser. ---
 app.get("/authorize", authLimiter, (req, res) => {
   const { response_type, client_id, redirect_uri, code_challenge, code_challenge_method, state } = req.query;
-
   if (response_type !== "code") {
-    return res.status(400).json({ error: "unsupported_response_type" });
+    return res.status(400).type("html").send(renderAuthorizeError("Unsupported response_type."));
   }
   if (redirect_uri !== ALLOWED_REDIRECT_URI) {
-    return res.status(400).json({ error: "invalid_request", error_description: "Unrecognized redirect_uri" });
+    return res.status(400).type("html").send(renderAuthorizeError("Unrecognized redirect_uri."));
+  }
+  res.type("html").send(renderAuthorizeForm({ client_id, redirect_uri, code_challenge, code_challenge_method, state, error: null }));
+});
+
+app.post("/authorize", authLimiter, async (req, res) => {
+  const { response_type, client_id, redirect_uri, code_challenge, code_challenge_method, state, notion_token } = req.body ?? {};
+
+  if (response_type !== "code") {
+    return res.status(400).type("html").send(renderAuthorizeError("Unsupported response_type."));
+  }
+  if (redirect_uri !== ALLOWED_REDIRECT_URI) {
+    return res.status(400).type("html").send(renderAuthorizeError("Unrecognized redirect_uri."));
+  }
+
+  if (typeof notion_token !== "string" || notion_token.trim().length === 0) {
+    return res.type("html").send(renderAuthorizeForm({ client_id, redirect_uri, code_challenge, code_challenge_method, state, error: "Please paste your Notion integration token." }));
+  }
+  const notionToken = notion_token.trim();
+
+  try {
+    await createNotionClient(notionToken).users.me({});
+  } catch {
+    return res.type("html").send(renderAuthorizeForm({ client_id, redirect_uri, code_challenge, code_challenge_method, state, error: "Notion rejected this token — check it was copied fully and that the integration has been shared with at least one page." }));
   }
 
   const code = randomUUID();
   codes.set(code, {
+    notionToken,
     clientId: typeof client_id === "string" ? client_id : null,
     redirectUri: redirect_uri,
     codeChallenge: typeof code_challenge === "string" ? code_challenge : null,
@@ -110,15 +193,18 @@ app.get("/authorize", authLimiter, (req, res) => {
   res.redirect(url.toString());
 });
 
-// --- Token: this is where client_secret arrives, and here it IS the
-// Notion token. We verify it against the real Notion API before minting
-// anything, so a bad paste fails here with a clear message instead of
-// failing silently on every later tool call. ---
+// --- Token: the back-channel exchange. The Notion token is NOT read here
+// anymore — it was already validated and bound to the auth code at the
+// personal /authorize step. Here we just pull it off the code binding and
+// optionally check client_secret against the uniform SHARED_CLIENT_SECRET. ---
 app.post("/token", authLimiter, async (req, res) => {
   const { grant_type } = req.body ?? {};
 
   if (grant_type === "refresh_token") {
-    const { refresh_token } = req.body;
+    const { refresh_token, client_secret } = req.body;
+    if (SHARED_CLIENT_SECRET && client_secret !== SHARED_CLIENT_SECRET) {
+      return res.status(400).json({ error: "invalid_client", error_description: "client_secret mismatch" });
+    }
     const stored = refresh_token && refreshTokens.get(refresh_token);
     if (!stored || stored.expires < Date.now()) {
       return res.status(400).json({ error: "invalid_grant" });
@@ -165,18 +251,13 @@ app.post("/token", authLimiter, async (req, res) => {
     }
   }
 
-  if (typeof client_secret !== "string" || client_secret.trim().length === 0) {
-    return res.status(400).json({ error: "invalid_client", error_description: "client_secret (your Notion token) is required" });
-  }
-  const notionToken = client_secret.trim();
+  // The Notion token rides on this person's auth code (validated at
+  // /authorize), not on the shared client_secret.
+  const notionToken = stored.notionToken;
 
-  try {
-    await createNotionClient(notionToken).users.me({});
-  } catch {
-    return res.status(400).json({
-      error: "invalid_client",
-      error_description: "Notion rejected this token — check it was copied correctly and the integration has been shared with your pages.",
-    });
+  // Optional uniform connector check — same value for every org member.
+  if (SHARED_CLIENT_SECRET && client_secret !== SHARED_CLIENT_SECRET) {
+    return res.status(400).json({ error: "invalid_client", error_description: "client_secret mismatch" });
   }
 
   const accessToken = randomUUID();
