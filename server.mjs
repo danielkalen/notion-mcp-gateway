@@ -293,6 +293,44 @@ function checkAuth(req, res, next) {
 
 const transports = new Map(); // sessionId -> StreamableHTTPServerTransport
 
+// Per-session registry of in-flight JSON-RPC request ids. The MCP SDK's
+// stateful StreamableHTTPServerTransport (v1.30.0) routes each response to its
+// originating POST through a map keyed by JSON-RPC request id with NO
+// duplicate-in-flight guard: two concurrent POSTs on one session that reuse
+// the same id cross-wire — the second POST overwrites the first's routing
+// slot, so the first's response is delivered to the second's HTTP stream and
+// the first hangs. Clients that pool a single session across conversations and
+// number every request from 1 (e.g. claude.ai's custom MCP connector) hit this
+// under concurrent tool calls, and one conversation receives another's
+// response. We serialize only the colliding requests: a POST whose request id
+// is already in flight on the session waits for that id's HTTP response to be
+// fully delivered (the SDK clears _requestToStreamMapping[id] before the HTTP
+// response finishes) before being allowed to register its own slot.
+// Notifications and unique-id requests stay fully concurrent, so cancellation
+// and progress notifications are never blocked. See
+// modelcontextprotocol/typescript-sdk#2433.
+const inFlightBySession = new Map(); // sessionId -> Map<requestId, Promise>
+
+function extractRequestIds(body) {
+  if (!body) return [];
+  const messages = Array.isArray(body) ? body : [body];
+  const ids = [];
+  for (const m of messages) {
+    if (m && typeof m === "object" &&
+        typeof m.method === "string" &&
+        Object.prototype.hasOwnProperty.call(m, "id")) {
+      ids.push(m.id);
+    }
+  }
+  return ids;
+}
+
+function getInFlightMap(sessionId) {
+  let map = inFlightBySession.get(sessionId);
+  if (!map) { map = new Map(); inFlightBySession.set(sessionId, map); }
+  return map;
+}
+
 app.post("/mcp", checkAuth, async (req, res) => {
   const sessionId = req.headers["mcp-session-id"];
   let transport = sessionId ? transports.get(sessionId) : undefined;
@@ -301,10 +339,13 @@ app.post("/mcp", checkAuth, async (req, res) => {
     transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (id) => transports.set(id, transport),
-      onsessionclosed: (id) => transports.delete(id),
+      onsessionclosed: (id) => { transports.delete(id); inFlightBySession.delete(id); },
     });
     transport.onclose = () => {
-      if (transport.sessionId) transports.delete(transport.sessionId);
+      if (transport.sessionId) {
+        transports.delete(transport.sessionId);
+        inFlightBySession.delete(transport.sessionId);
+      }
     };
 
     const notion = createNotionClient(req.notionToken);
@@ -315,6 +356,43 @@ app.post("/mcp", checkAuth, async (req, res) => {
       transport: "http",
     });
     await mcpServer.connect(transport);
+  }
+
+  // Serialize colliding in-flight request ids within this session (see
+  // inFlightBySession above). Initialize requests carry no session id and are
+  // exempt — the client waits for the initialize response before sending more.
+  if (sessionId) {
+    const ids = extractRequestIds(req.body);
+    if (ids.length > 0) {
+      const inFlight = getInFlightMap(sessionId);
+      // Synchronously capture prior in-flight promises for these ids and
+      // register ourselves as the new holder. No awaits between capture and
+      // registration, so concurrent POSTs observe a consistent chain.
+      const waiters = ids.map((id) => inFlight.get(id)).filter(Boolean);
+      let markDone;
+      const done = new Promise((resolve) => { markDone = resolve; });
+      for (const id of ids) inFlight.set(id, done);
+      // Wait for any prior colliding request to finish delivering its
+      // response, then register a clean routing slot of our own.
+      if (waiters.length > 0) await Promise.all(waiters);
+
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        for (const id of ids) if (inFlight.get(id) === done) inFlight.delete(id);
+        markDone();
+      };
+      res.on("finish", release);
+      res.on("close", release);
+      try {
+        await transport.handleRequest(req, res, req.body);
+      } catch (err) {
+        release();
+        throw err;
+      }
+      return;
+    }
   }
 
   await transport.handleRequest(req, res, req.body);
@@ -333,6 +411,7 @@ app.delete("/mcp", checkAuth, async (req, res) => {
   if (!transport) return res.status(400).json({ error: "No active session" });
   await transport.handleRequest(req, res);
   transports.delete(sessionId);
+  inFlightBySession.delete(sessionId);
 });
 
 app.listen(PORT, "0.0.0.0", () => {
